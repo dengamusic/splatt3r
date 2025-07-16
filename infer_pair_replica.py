@@ -33,11 +33,23 @@ def load_c2w(traj_file: str, idx: int) -> torch.Tensor:
     return torch.from_numpy(np.linalg.inv(mats[idx]))  # (4,4)
 
 def lift_in_place(cloud: dict, R: torch.Tensor, t: torch.Tensor):
-    """Apply world transform to centroids + quaternions (keys *must* exist)."""
-    cloud['means'] = (R @ cloud['means'].T + t[:, None]).T
-    R_cam = quaternion_to_matrix(cloud['rotations'])         # (N,3,3)
-    cloud['rotations'] = matrix_to_quaternion((R @ R_cam.cpu()).to(R.device))
+    """
+    Move centroids + rotations from cam-1 space → world space.
+    Expects keys: 'means', 'rotations'
+      means      : (..., 3)
+      rotations  : (..., 4)  (x,y,z,w)
+    R, t         : (3,3) and (3,)  camera-1 → world
+    """
+    # ── centroids ───────────────────────────────────────────────────────────
+    #  (...,3) @ (3,3)ᵀ  -> (...,3)
+    cloud['means'] = cloud['means'] @ R.T + t          # broadcast works
 
+    # ── quaternions ────────────────────────────────────────────────────────
+    R_cam = quaternion_to_matrix(cloud['rotations'])   # (...,3,3)
+    # prepend world rotation:  R_world = R * R_cam
+    R_world = R @ R_cam.movedim(-3, -2)               # (...,3,3)
+    cloud['rotations'] = matrix_to_quaternion(R_world)
+    
 # ── CLI ────────────────────────────────────────────────────────────────────
 p = argparse.ArgumentParser()
 p.add_argument('img1'); p.add_argument('img2')
