@@ -34,20 +34,23 @@ def load_c2w(traj_file: str, idx: int) -> torch.Tensor:
 
 def lift_in_place(cloud: dict, R: torch.Tensor, t: torch.Tensor):
     """
-    Move centroids + rotations from cam-1 space → world space.
-    Expects keys: 'means', 'rotations'
-      means      : (..., 3)
-      rotations  : (..., 4)  (x,y,z,w)
-    R, t         : (3,3) and (3,)  camera-1 → world
-    """
-    # ── centroids ───────────────────────────────────────────────────────────
-    #  (...,3) @ (3,3)ᵀ  -> (...,3)
-    cloud['means'] = cloud['means'] @ R.T + t          # broadcast works
+    Lift MASt3R Gaussian dict from cam-1 frame ➜ world frame.
 
-    # ── quaternions ────────────────────────────────────────────────────────
-    R_cam = quaternion_to_matrix(cloud['rotations'])   # (...,3,3)
-    # prepend world rotation:  R_world = R * R_cam
-    R_world = R @ R_cam.movedim(-3, -2)               # (...,3,3)
+    Expects keys:
+      cloud['means']      (..., 3)
+      cloud['rotations']  (..., 4)   (x,y,z,w) unit quaternion
+    """
+    means_key = 'means'
+    if 'means_in_other_view' in cloud:
+        means_key = 'means_in_other_view'
+    # ── 1. centroids  --------------------------------------------------------
+    # (...,3) @ (3,3)ᵀ  + t  -> (...,3)
+    cloud[means_key] = cloud[means_key] @ R.T + t
+
+    # ── 2. orientations -----------------------------------------------------
+    R_cam = quaternion_to_matrix(cloud['rotations'])       # (...,3,3)
+    # left-multiply by world rotation; einsum broadcasts cleanly
+    R_world = torch.einsum('ij,...jk->...ik', R, R_cam)    # (...,3,3)
     cloud['rotations'] = matrix_to_quaternion(R_world)
     
 # ── CLI ────────────────────────────────────────────────────────────────────
@@ -95,10 +98,11 @@ if args.save_npz:
     npz_path = os.path.join(args.outdir, 'gaussians.npz')
     np.savez_compressed(
         npz_path,
-        xyz      = torch.cat((pred1['means'],      pred2['means']     )).cpu().numpy(),
-        rot      = torch.cat((pred1['rotations'],  pred2['rotations'] )).cpu().numpy(),
-        scale    = torch.cat((pred1['scales'],     pred2['scales']    )).cpu().numpy(),
-        sh       = torch.cat((pred1['sh'],         pred2['sh']        )).cpu().numpy(),
-        opacity  = torch.cat((pred1['opacities'],  pred2['opacities'] )).cpu().numpy(),
+        xyz     = torch.cat((pred1['means'],      pred2['means_in_other_view']     )).detach().cpu().numpy(),
+        rot     = torch.cat((pred1['rotations'],  pred2['rotations'] )).detach().cpu().numpy(),
+        scale   = torch.cat((pred1['scales'],     pred2['scales']    )).detach().cpu().numpy(),
+        sh      = torch.cat((pred1['sh'],         pred2['sh']        )).detach().cpu().numpy(),
+        opacity = torch.cat((pred1['opacities'],  pred2['opacities'] )).detach().cpu().numpy(),
     )
+
     print(f"✓ wrote {npz_path}")
