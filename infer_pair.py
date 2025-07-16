@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import argparse, os, sys, torch
+import argparse, os, sys, torch 
+import numpy as np
 from huggingface_hub import hf_hub_download
 
 sys.path.extend(['src/mast3r_src', 'src/mast3r_src/dust3r', 'src/pixelsplat_src'])
@@ -14,6 +15,8 @@ parser.add_argument('img2', help='second RGB image')
 parser.add_argument('--outdir', default='results', help='output folder')
 parser.add_argument('--model-dir', default=None,
                     help='where to cache / load the Splatt3R checkpoint')
+parser.add_argument('--save-npz', action='store_true',
+                    help='also write gaussians.npz with full tensors')
 args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -45,3 +48,16 @@ os.makedirs(args.outdir, exist_ok=True)
 ply_path = os.path.join(args.outdir, 'gaussians.ply')
 export.save_as_ply(pred1, pred2, ply_path)
 print(f"Wrote {ply_path}")
+
+if args.save_npz:
+    npz_path = os.path.join(args.outdir, "gaussians.npz")
+    # pack arrays so dtype is preserved exactly
+    np.savez_compressed(
+        npz_path,
+        xyz     = pred1['mean'].cpu().numpy(),      # (N,3)
+        rot     = pred1['qvec'].cpu().numpy(),      # (N,4)
+        scale   = pred1['scale'].cpu().numpy(),     # (N,3)
+        sh      = pred1['sh_feat'].cpu().numpy(),   # (N, 3*(deg1)^2)
+        opacity = pred1['opacity'].cpu().numpy(),   # (N,1)
+    )
+    print(f"Wrote {npz_path}")
