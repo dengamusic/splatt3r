@@ -53,6 +53,25 @@ def lift_in_place(cloud: dict, R: torch.Tensor, t: torch.Tensor):
     R_world = torch.einsum('ij,...jk->...ik', R, R_cam)    # (...,3,3)
     cloud['rotations'] = matrix_to_quaternion(R_world)
     
+def combine_predictions(pred1: dict, pred2: dict, *, to_cpu=True) -> dict:
+    default_alt = {
+        "means": "means_in_other_view",
+        "pts3d": "pts3d_in_other_view",
+    }
+    merged = {}
+    for k, v1 in pred1.items():
+        if k in default_alt and default_alt[k] in pred2:
+            v2 = pred2[default_alt[k]]
+        else:
+            v2 = pred2[k]  # assume same key exists
+
+        combined = torch.cat((v1, v2), dim=0)
+        if to_cpu:
+            combined = combined.detach().cpu()
+        merged[k] = combined
+
+    return merged
+
 # ── CLI ────────────────────────────────────────────────────────────────────
 p = argparse.ArgumentParser()
 p.add_argument('img1'); p.add_argument('img2')
@@ -94,15 +113,8 @@ ply_path = os.path.join(args.outdir, 'gaussians.ply')
 export.save_as_ply(pred1, pred2, ply_path)
 print(f"✓ wrote {ply_path}")
 
-if args.save_npz:
-    npz_path = os.path.join(args.outdir, 'gaussians.npz')
-    np.savez_compressed(
-        npz_path,
-        xyz     = torch.cat((pred1['means'],      pred2['means_in_other_view']     )).detach().cpu().numpy(),
-        rot     = torch.cat((pred1['rotations'],  pred2['rotations'] )).detach().cpu().numpy(),
-        scale   = torch.cat((pred1['scales'],     pred2['scales']    )).detach().cpu().numpy(),
-        sh      = torch.cat((pred1['sh'],         pred2['sh']        )).detach().cpu().numpy(),
-        opacity = torch.cat((pred1['opacities'],  pred2['opacities'] )).detach().cpu().numpy(),
-    )
 
-    print(f"✓ wrote {npz_path}")
+npz_path = os.path.join(args.outdir, 'gaussians.npz')
+combined = combine_predictions(pred1, pred2)
+np.savez_compressed(npz_path, **{k: v.numpy() for k, v in combined.items()})
+print(f"✓ wrote {npz_path}")
