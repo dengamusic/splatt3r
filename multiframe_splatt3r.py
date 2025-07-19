@@ -11,8 +11,8 @@
 
 import argparse, itertools, os, sys
 from collections import defaultdict
-
 import torch, numpy as np, einops
+import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from scipy.spatial import cKDTree
 
@@ -23,7 +23,6 @@ import main                                   # MASt3R entry
 from pytorch3d.transforms import (
     quaternion_to_matrix, matrix_to_quaternion
 )
-import torch, torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 
@@ -111,10 +110,12 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     # ---- Splatt3r model ----------------------------------------------------
-    ckpt = hf_hub_download("brandonsmart/splatt3r_v1.0",
-                           "epoch=19-step=1200.ckpt",
-                           local_dir="checkpoints", local_dir_use_symlinks=False)
+    ckpt = hf_hub_download(
+        "brandonsmart/splatt3r_v1.0", "epoch=19-step=1200.ckpt",
+        local_dir=args.model_dir, local_dir_use_symlinks=False, resume_download=True
+    )
     model = main.MAST3RGaussians.load_from_checkpoint(ckpt, device).eval().to(device)
+
 
     # Pose dictionary: frame-index → (R_to0, t_to0)
     poses_to_0 = {0: (torch.eye(3, device=device),
