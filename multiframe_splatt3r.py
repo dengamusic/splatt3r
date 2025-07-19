@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ---------------------------------------------------------------------------
-#  three_splatt3r_merge.py — demonstrator for 3 images  ==  3 pairs
+#  multiframe_splatt3r.py — demonstrator for 3 images  ==  3 pairs
 # ---------------------------------------------------------------------------
 #  Usage:
-#  python three_splatt3r_merge.py img0.jpg img1.jpg img2.jpg \
+#  python multiframe_splatt3r.py img0.jpg img1.jpg img2.jpg \
 #         --outdir outputs/three --save-ply
 #
 #  Needs: torch numpy einops scipy plyfile huggingface_hub
@@ -15,12 +15,10 @@ from collections import defaultdict
 import torch, numpy as np, einops
 from huggingface_hub import hf_hub_download
 from scipy.spatial import cKDTree
-from scipy.spatial.transform import Rotation
 
 # ---- local paths to Splatt3r ------------------------------------------------
 sys.path.extend(["src/mast3r_src", "src/mast3r_src/dust3r", "src/pixelsplat_src"])
 from dust3r.utils.image import load_images
-from dust3r.utils import geometry
 import main                                   # MASt3R entry
 from pytorch3d.transforms import (
     quaternion_to_matrix, matrix_to_quaternion
