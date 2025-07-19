@@ -103,6 +103,7 @@ def main():
     ap.add_argument("images", nargs=3, help="exactly three images")
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--radius", type=float, default=0.02, help="dedup radius")
+    ap.add_argument('--model-dir', default=None)
     ap.add_argument("--save-ply", action="store_true")
     args = ap.parse_args()
 
