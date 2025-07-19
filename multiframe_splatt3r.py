@@ -98,108 +98,105 @@ def save_as_ply(cloud, path):
 
 # ---------------------------------------------------------------------------
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("images", nargs=3, help="exactly three images")
-    ap.add_argument("--outdir", required=True)
-    ap.add_argument("--radius", type=float, default=0.02, help="dedup radius")
-    ap.add_argument('--model-dir', default=None)
-    ap.add_argument("--save-ply", action="store_true")
-    args = ap.parse_args()
+ap = argparse.ArgumentParser()
+ap.add_argument("images", nargs=3, help="exactly three images")
+ap.add_argument("--outdir", required=True)
+ap.add_argument("--radius", type=float, default=0.02, help="dedup radius")
+ap.add_argument('--model-dir', default=None)
+ap.add_argument("--save-ply", action="store_true")
+args = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.outdir, exist_ok=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs(args.outdir, exist_ok=True)
 
-    # ---- Splatt3r model ----------------------------------------------------
-    ckpt = hf_hub_download(
-        "brandonsmart/splatt3r_v1.0", "epoch=19-step=1200.ckpt",
-        local_dir=args.model_dir, local_dir_use_symlinks=False, resume_download=True
-    )
-    model = main.MAST3RGaussians.load_from_checkpoint(ckpt, device).eval().to(device)
-
-
-    # Pose dictionary: frame-index → (R_to0, t_to0)
-    poses_to_0 = {0: (torch.eye(3, device=device),
-                      torch.zeros(3, device=device))}
-
-    merged_clouds = []
-
-    # --- helper -------------------------------------------------------------
-    def run_pair(i, j):
-        ims = load_images([args.images[i], args.images[j]], size=512, verbose=False)
-        for im in ims:
-            im["img"]           = im["img"].to(device)
-            im["original_img"]  = im["original_img"].to(device)
-            im["true_shape"]    = torch.as_tensor(im["true_shape"])
-        return model(ims[0], ims[1])   # returns (pred_i, pred_j)
-
-    # -----------------------------------------------------------------------
-    print("\nSTEP 1: pairs (0,1) and (0,2) — bootstrap others")
-    for j in (1, 2):
-        p0, pj = run_pair(0, j)
-
-        # get R_ j→0 , t_j→0 from Splatt3r
-        R_j0 = build_rotation(pj["cam_unnorm_rots"])[0]
-        t_j0 = pj["cam_trans"][0]
-
-        poses_to_0[j] = (R_j0, t_j0)
-
-        print(f"\nPair (0,{j}):")
-        print("  R_j0 =\n", R_j0.cpu().numpy())
-        print("  det(R) =", torch.det(R_j0).item())
-        print("  t_j0 =", t_j0.cpu().tolist())
-
-        transform_cloud_(p0, *poses_to_0[0])    # identity
-        transform_cloud_(pj, R_j0, t_j0)
-        merged_clouds += [p0, pj]
-
-    print("\nSTEP 2: pair (1,2) — uses chained poses")
-    p1, p2 = run_pair(1, 2)
-
-    # Splatt3r pose R_2→1, t_2→1
-    R21 = build_rotation(p2["cam_unnorm_rots"])[0]
-    t21 = p2["cam_trans"][0]
-    print("\nPair (1,2):")
-    print("  R_21 =\n", R21.cpu().numpy())
-    print("  det(R) =", torch.det(R21).item())
-    print("  t_21 =", t21.cpu().tolist())
-
-    # frame-1 → frame-0 we already know
-    R10, t10 = poses_to_0[1]
-
-    # chain: R20 = R10 · R21 ,  t20 = R10·t21 + t10
-    R20 = R10 @ R21
-    t20 = R10 @ t21 + t10
-    poses_to_0[2] = (R20, t20)    # (was identical, just checking)
-
-    print("\nChained pose 2→0 (via 1):")
-    print("  R_20 =\n", R20.cpu().numpy())
-    print("  det(R) =", torch.det(R20).item())
-    print("  t_20 =", t20.cpu().tolist())
-
-    transform_cloud_(p1, R10, t10)
-    transform_cloud_(p2, R20, t20)
-    merged_clouds += [p1, p2]
-
-    # -----------------------------------------------------------------------
-    print("\nSTEP 3: merge & deduplicate")
-    merged = concat(merged_clouds)
-    mask = dedup_xyz(merged["means"], args.radius)
-    for k, v in merged.items():
-        if v.shape[0] == len(mask):
-            merged[k] = v[mask]
-
-    npz_path = os.path.join(args.outdir, "merged.npz")
-    np.savez_compressed(npz_path, **{k: v.cpu().numpy() for k, v in merged.items()})
-    print(f"\n✓ wrote {npz_path}  (kept {mask.sum().item()} / {len(mask)})")
-
-    if args.save_ply:
-        ply_path = os.path.join(args.outdir, "merged.ply")
-        save_as_ply(merged, ply_path)
-        print("✓ wrote", ply_path)
-
-    print("\nDone.\n")
+# ---- Splatt3r model ----------------------------------------------------
+ckpt = hf_hub_download(
+    "brandonsmart/splatt3r_v1.0", "epoch=19-step=1200.ckpt",
+    local_dir=args.model_dir, local_dir_use_symlinks=False, resume_download=True
+)
+model = main.MAST3RGaussians.load_from_checkpoint(ckpt, device).eval().to(device)
 
 
-if __name__ == "__main__":
-    main()
+# Pose dictionary: frame-index → (R_to0, t_to0)
+poses_to_0 = {0: (torch.eye(3, device=device),
+                    torch.zeros(3, device=device))}
+
+merged_clouds = []
+
+# --- helper -------------------------------------------------------------
+def run_pair(i, j):
+    ims = load_images([args.images[i], args.images[j]], size=512, verbose=False)
+    for im in ims:
+        im["img"]           = im["img"].to(device)
+        im["original_img"]  = im["original_img"].to(device)
+        im["true_shape"]    = torch.as_tensor(im["true_shape"])
+    return model(ims[0], ims[1])   # returns (pred_i, pred_j)
+
+# -----------------------------------------------------------------------
+print("\nSTEP 1: pairs (0,1) and (0,2) — bootstrap others")
+for j in (1, 2):
+    p0, pj = run_pair(0, j)
+
+    # get R_ j→0 , t_j→0 from Splatt3r
+    R_j0 = build_rotation(pj["cam_unnorm_rots"])[0]
+    t_j0 = pj["cam_trans"][0]
+
+    poses_to_0[j] = (R_j0, t_j0)
+
+    print(f"\nPair (0,{j}):")
+    print("  R_j0 =\n", R_j0.cpu().numpy())
+    print("  det(R) =", torch.det(R_j0).item())
+    print("  t_j0 =", t_j0.cpu().tolist())
+
+    transform_cloud_(p0, *poses_to_0[0])    # identity
+    transform_cloud_(pj, R_j0, t_j0)
+    merged_clouds += [p0, pj]
+
+print("\nSTEP 2: pair (1,2) — uses chained poses")
+p1, p2 = run_pair(1, 2)
+
+# Splatt3r pose R_2→1, t_2→1
+R21 = build_rotation(p2["cam_unnorm_rots"])[0]
+t21 = p2["cam_trans"][0]
+print("\nPair (1,2):")
+print("  R_21 =\n", R21.cpu().numpy())
+print("  det(R) =", torch.det(R21).item())
+print("  t_21 =", t21.cpu().tolist())
+
+# frame-1 → frame-0 we already know
+R10, t10 = poses_to_0[1]
+
+# chain: R20 = R10 · R21 ,  t20 = R10·t21 + t10
+R20 = R10 @ R21
+t20 = R10 @ t21 + t10
+poses_to_0[2] = (R20, t20)    # (was identical, just checking)
+
+print("\nChained pose 2→0 (via 1):")
+print("  R_20 =\n", R20.cpu().numpy())
+print("  det(R) =", torch.det(R20).item())
+print("  t_20 =", t20.cpu().tolist())
+
+transform_cloud_(p1, R10, t10)
+transform_cloud_(p2, R20, t20)
+merged_clouds += [p1, p2]
+
+# -----------------------------------------------------------------------
+print("\nSTEP 3: merge & deduplicate")
+merged = concat(merged_clouds)
+mask = dedup_xyz(merged["means"], args.radius)
+for k, v in merged.items():
+    if v.shape[0] == len(mask):
+        merged[k] = v[mask]
+
+npz_path = os.path.join(args.outdir, "merged.npz")
+np.savez_compressed(npz_path, **{k: v.cpu().numpy() for k, v in merged.items()})
+print(f"\n✓ wrote {npz_path}  (kept {mask.sum().item()} / {len(mask)})")
+
+if args.save_ply:
+    ply_path = os.path.join(args.outdir, "merged.ply")
+    save_as_ply(merged, ply_path)
+    print("✓ wrote", ply_path)
+
+print("\nDone.\n")
+
+
