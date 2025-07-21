@@ -107,7 +107,6 @@ for i, j in pairs:
     a, b, c, d, full_i, full_j = run_pair(i, j)
     v1.append(a); v2.append(b); p1.append(c); p2.append(d)
     gauss[i].append(full_i)
-    gauss[j].append(full_j)
 
 bat = lambda x: collate_with_cat(x, lists=True)
 d3 = {"view1": bat(v1), "view2": bat(v2), "pred1": bat(p1), "pred2": bat(p2)}
