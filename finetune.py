@@ -1,25 +1,11 @@
 #!/usr/bin/env python3
-"""
-Fine‑tune a 3‑D Gaussian point cloud so its renders match ground‑truth images.
-
-Additions over the original version
------------------------------------
-* The CUDA renderer (`DecoderSplattingCUDA`) is defined **inline**.
-* It now expects **one** Gaussian‑dict argument that matches what the
-  training loop already creates (`means`, `covariances`, `sh`, `opacities`).
-* Automatic SH reshaping (from [B,G,3*d] → [B,G,3,d]).
-* `renderer.to(device)` so kernels run on the correct GPU.
-"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Imports
-# ──────────────────────────────────────────────────────────────────────────────
 import argparse
 from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import os, imageio.v2 as imageio
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torchvision.transforms.functional import to_tensor
@@ -27,22 +13,7 @@ from plyfile import PlyData, PlyElement
 from utils.geometry import build_covariance, normalize_intrinsics
 from src.pixelsplat_src.cuda_splatting import render_cuda  # compiled extension
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  CUDA renderer (now self‑contained)
-# ──────────────────────────────────────────────────────────────────────────────
 class DecoderSplattingCUDA(torch.nn.Module):
-    """
-    Very light wrapper around the `render_cuda` kernel.
-
-    Expected gaussian‑dict keys
-    ---------------------------
-    * means        – [B,G,3]
-    * covariances  – [B,G,3,3]
-    * sh           – [B,G,3*d]  (will be reshaped to [B,G,3,d] on‑the‑fly)
-    * opacities    – [B,G]
-    """
-
     def __init__(self, background_color=(0.0, 0.0, 0.0)):
         super().__init__()
         self.register_buffer(
@@ -52,13 +23,6 @@ class DecoderSplattingCUDA(torch.nn.Module):
         )
 
     def forward(self, batch: dict, gaussians: dict, image_shape):
-        """
-        Parameters
-        ----------
-        batch       – dict with 'context' (len==1) and 'target' (len==N_views) entries
-        gaussians   – point‑cloud dict (means / covariances / sh / opacities)
-        image_shape – tuple (H, W)
-        """
         H, W = image_shape
         b = gaussians["means"].shape[0]         # usually 1
         base_pose = batch["context"][0]["camera_pose"]      # [B,4,4]
@@ -74,7 +38,8 @@ class DecoderSplattingCUDA(torch.nn.Module):
         intrinsics = normalize_intrinsics(intrinsics, (H, W))[..., :3, :3]
 
         # Poses into canonical scene frame (that of the first context view)
-        extrinsics = inv_base_pose[:, None] @ extrinsics
+        # extrinsics = inv_base_pose[:, None] @ extrinsics
+        extrinsics = torch.inverse(extrinsics)
         _, V, _, _ = extrinsics.shape  # number of target views
 
         # Gaussian buffers
@@ -91,6 +56,11 @@ class DecoderSplattingCUDA(torch.nn.Module):
         near = torch.full((b, V), 0.1,  device=means.device)
         far  = torch.full((b, V), 1000., device=means.device)
 
+        with torch.no_grad():
+            cam = extrinsics[0,0]                 # w2c of the rendered view
+            xyz_cam = (cam[:3,:3] @ means[0].T + cam[:3,3:4]).T
+            print("depth (z) min/max  :", xyz_cam[:,2].min().item(),
+                                           xyz_cam[:,2].max().item())
         # Run CUDA kernel – everything flattened to (B*V, …)
         color = render_cuda(
             rearrange(extrinsics,  "b v i j -> (b v) i j"),
@@ -147,22 +117,54 @@ def save_as_ply(cloud, path):
 
     PlyData([PlyElement.describe(verts, "vertex")], text=False).write(str(path))
 
-def load_images(paths, device, out_hw=None):
+def load_images(paths, device, out_hw=None, save_vis=False):
     imgs = []
-    for p in paths:
-        img = to_tensor(imageio.imread(p)).to(device) / 255.0  # [C,H,W]
+    os.makedirs("vis", exist_ok=True)
+    for i, p in enumerate(paths):        
+        img_np = imageio.imread(p)                     # H×W×C, uint8/16/32
+        if img_np.shape[-1] == 4:                      # drop alpha
+            img_np = img_np[..., :3]
+
+        if np.issubdtype(img_np.dtype, np.integer):
+            img_np = img_np.astype(np.float32) / np.iinfo(img_np.dtype).max
+        else:  # assume already float in [0, 1] or [0, 255]
+            img_np = img_np.astype(np.float32)
+            if img_np.max() > 1.01:       # most PNG/JPEG loaders keep 0‑255
+                img_np /= 255.0
+
+        img = to_tensor(img_np).to(device)             # C×H×W, float32
+
         if out_hw is not None:
-            img = F.interpolate(
-                img.unsqueeze(0), size=out_hw, mode="bilinear", align_corners=False
-            )[0]
+            img = F.interpolate(img[None], size=out_hw,
+                                 mode="bilinear", align_corners=False)[0]
         imgs.append(img)
+        if save_vis:
+            imageio.imwrite(
+                f"vis/loaded_scaled_{i:04d}.png",
+                tensor_to_png(img)
+            )
     return imgs
+
+def tensor_to_png(t: torch.Tensor) -> np.ndarray:
+    """[C,H,W] float in [0,1] →  uint8 H×W×3"""
+    t = t.detach().clamp(0, 1).mul_(255).to(torch.uint8)   # on‑GPU is fine
+    return t.permute(1, 2, 0).detach().cpu().numpy()                # H,W,3
 
 
 def load_poses(path, expected):
     arr = np.loadtxt(path).reshape(-1, 4, 4)
     assert arr.shape[0] == expected, f"Expected {expected} poses, got {arr.shape[0]}"
     return [torch.tensor(M, dtype=torch.float32) for M in arr]
+
+def save_debug_image(gt, rgb_pred, it, k):
+    os.makedirs("vis", exist_ok=True)
+
+    pred_img = tensor_to_png(rgb_pred[0, 0])
+    gt_img   = tensor_to_png(gt[0])
+
+    side_by_side = np.concatenate([pred_img, gt_img], axis=1)
+
+    imageio.imwrite(f"vis/iter{it:05d}_view{k}.png", side_by_side)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -190,6 +192,10 @@ def main():
     ap.add_argument("--output", type=str, default="finetuned_splatt3r.npz")
     ap.add_argument("--max_points", type=int, default=None,
                     help="Render only a subset of Gaussians each iter")
+    ap.add_argument("--render_only", action="store_true",
+                help="Skip training and just render one image")
+    ap.add_argument("--view", type=int, default=0,
+                help="Which image index to render (only with --render_only)")
     args = ap.parse_args()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -214,17 +220,22 @@ def main():
     W_scaled = int(round(args.W * scale))
     H_scaled = int(round(args.H * scale))
 
-    imgs = load_images(args.images, dev, out_hw=(H_scaled, W_scaled))
+    imgs = load_images(args.images, dev, out_hw=(H_scaled, W_scaled), save_vis=True)
+    
+    for i, p in enumerate(args.images):
+        print(f"{i}: {Path(p).name}")
+
     num_views = len(imgs)
     poses_c2w = load_poses(args.posesaftericp, num_views)
 
     intrinsics = make_intrinsics(
-        args.fx * scale,
-        args.fy * scale,
-        args.cx * scale,
-        args.cy * scale,
-        dev,
-    ).unsqueeze(0)  # [1,4,4]
+        args.fx,
+        args.fy,
+        args.cx,
+        args.cy,
+        dev)
+    intrinsics[:2] *= scale
+    intrinsics = intrinsics.unsqueeze(0)  # [1,4,4]
 
     # ──────────────────────────────────────────────────────────────────────
     # 3. Renderer & optimiser
@@ -235,6 +246,55 @@ def main():
     )
 
     # ──────────────────────────────────────────────────────────────────────
+    # 2.5  Quick render‑only path (debugging)
+    # ──────────────────────────────────────────────────────────────────────
+    if args.render_only:
+        choose = torch.randperm(gaussians["means"].shape[0], device=dev)[:args.max_points]
+
+        pt_dict = {
+            "means":       gaussians["means"][choose][None],                 # [1, G, 3]
+            "covariances": build_covariance(
+                               gaussians["log_scales"].exp()[choose],
+                               gaussians["rotations"][choose]
+                           )[None],                                          # [1, G, 3, 3]
+            "sh":          gaussians["sh"][choose][None],                    # [1, G, d]
+            "opacities":   torch.sigmoid(gaussians["logit_opacities"]
+                                         .squeeze(-1))[choose][None],        # [1, G]
+        }
+        #pt_dict["covariances"] *= 0.05
+        with torch.no_grad():
+            # cov: [1, G, 3, 3]
+            cov = pt_dict["covariances"]          # [B=1, G, 3, 3]
+            diag = cov.diagonal(dim1=-2, dim2=-1) # [1, G, 3]  (σ²_x, σ²_y, σ²_z)
+            sigmas = diag.sqrt()                  # standard deviations
+            sigma_eff = sigmas.max(-1).values     # pick the largest axis → [1, G]
+
+            print("median σ_eff :", sigma_eff.median().item())
+            depths = pt_dict["means"][0].norm(dim=1)   # point → camera distance
+            print("median depth :", depths.median().item())
+
+        k = int(np.clip(args.view, 0, len(imgs) - 1))
+
+        batch = {
+            "context": [{
+                "camera_pose": poses_c2w[0].unsqueeze(0).to(dev),
+                "camera_intrinsics": intrinsics,
+            }],
+            "target":  [{
+                "camera_pose": poses_c2w[k].unsqueeze(0).to(dev),
+                "camera_intrinsics": intrinsics,
+            }],
+        }
+
+        with torch.no_grad():
+            rgb_pred, _ = renderer(batch, pt_dict, (H_scaled, W_scaled))
+
+        out_png = Path(args.output).with_suffix(f".view{k:03d}.png")
+        imageio.imwrite(out_png, tensor_to_png(rgb_pred[0, 0]))
+        print(f"✓ wrote {out_png}")
+        return            # ---------- NOTHING BELOW HERE RUNS ----------
+
+    # ──────────────────────────────────────────────────────────────────────
     # 4. Training loop
     # ──────────────────────────────────────────────────────────────────────
     for it in range(args.iters):
@@ -243,7 +303,7 @@ def main():
 
         idxs = np.random.choice(num_views, args.batch, replace=False)
         covariances = build_covariance(
-            gaussians["log_scales"], gaussians["rotations"]
+            gaussians["log_scales"].exp(), gaussians["rotations"]
         )                                           # [N,3,3]
         opacities = torch.sigmoid(
             gaussians["logit_opacities"]).squeeze(-1)   # [N]
@@ -280,7 +340,7 @@ def main():
             )                                  # [1,1,3,H,W]
             gt = imgs[k].unsqueeze(0)          # [1,3,H,W]
             loss += torch.nn.functional.l1_loss(rgb_pred[:, 0], gt)
-
+            save_debug_image(gt, rgb_pred, it, k)
         (loss / args.batch).backward()
         optim.step()
 
