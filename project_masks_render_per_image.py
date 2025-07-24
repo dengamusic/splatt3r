@@ -101,7 +101,7 @@ def make_intrinsics(fx, fy, cx, cy, device):
     return K
 
 def project_points(means_w, pose_c2w, K, H, W):
-    w2c = torch.inverse(pose_c2w)
+    w2c = pose_c2w # torch.inverse(pose_c2w)
     R = w2c[:3, :3]
     t = w2c[:3, 3]
     Xc = (R @ means_w.T + t[:, None]).T
