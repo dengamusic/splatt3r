@@ -1,4 +1,4 @@
-# Pipeline Usage
+# Extending Splatt3R: Multi-View Semantic Gaussian Splatting - Pipeline Usage
 
 This project provides a one-command Bash pipeline **and** per-script entry points.
 
@@ -95,4 +95,17 @@ python project_masks.py <run_outdir>
 
 - The five image paths must exist and follow `rgb_*.png`.  
 - `global.py` writes `imgs/` into `<run_outdir>`, which is input for GSAM preprocessing.  
-- Adjust `RADIUS`, `ICP_THRESH`, and `INTRINSICS_LINE` to match your dataset.  
+- Adjust `RADIUS`, `ICP_THRESH`, and `INTRINSICS_LINE` to match your dataset.
+  
+### Environment Variables Setup (try in case of issues)
+
+Before running the pipeline or scripts, set the environment paths correctly:
+
+```bash
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH=$(dirname "$(pwd)"):$PYTHONPATH
+```
+
+- `LD_LIBRARY_PATH`: Prioritizes libraries from your active Conda environment.
+- `PYTHONPATH`: Adds the parent directory of the current project to Python's module search paths.
+
