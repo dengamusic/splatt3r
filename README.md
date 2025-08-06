@@ -9,6 +9,9 @@ This project provides a one-command Bash pipeline **and** per-script entry point
 3. `project_masks.py` — semantic projection
 
 ---
+## Setup Dependencies and Submodules
+Follow documentations of [Grounded SAM](https://github.com/IDEA-Research/Grounded-Segment-Anything) and [Splatt3r](https://github.com/btsmart/splatt3r)
+
 ## Download Replica Dataset
 ```bash
 cd data
