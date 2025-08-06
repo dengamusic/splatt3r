@@ -9,7 +9,11 @@ This project provides a one-command Bash pipeline **and** per-script entry point
 3. `project_masks.py` — semantic projection
 
 ---
-
+## Download Replica Dataset
+```bash
+cd data
+./download_replica.sh
+```
 ## Run the whole pipeline
 
 ```bash
