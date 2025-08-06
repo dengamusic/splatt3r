@@ -5,7 +5,7 @@ set -euo pipefail
 PY=python
 GLOBAL=global.py
 GSAM_PRE=scripts/preprocess_grounded_sam.py
-RENDER=project_masks_render_per_image.py
+RENDER=project_masks.py
 
 DATA_ROOT=data/replica_v2
 OUT_ROOT=data
