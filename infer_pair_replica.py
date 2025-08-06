@@ -23,14 +23,16 @@ def frame_index(img_path: str) -> int:
     m = re.search(r'(\d+)\D*$', os.path.splitext(os.path.basename(img_path))[0])
     if not m:
         raise ValueError(f"Cannot parse frame index from {img_path}")
-    return int(m.group(1))
+    ind = int(m.group(1))
+    print(f"frame {ind}")
+    return ind
 
 def load_c2w(traj_file: str, idx: int) -> torch.Tensor:
     """camera→world (4×4) from Replica traj_w_cgl.txt"""
     mats = np.loadtxt(traj_file, dtype=np.float32).reshape(-1, 4, 4)
     if idx >= len(mats):
         raise IndexError(f"Index {idx} out of bounds for {traj_file}")
-    return torch.from_numpy(np.linalg.inv(mats[idx]))  # (4,4)
+    return torch.from_numpy(mats[idx])  # (4,4)
 
 def lift_in_place(cloud: dict, R: torch.Tensor, t: torch.Tensor):
     """
@@ -104,7 +106,17 @@ idx1 = frame_index(args.img1)
 c2w1 = load_c2w(args.traj_file, idx1).to(device)
 R1, t1 = c2w1[:3, :3], c2w1[:3, 3]
 
+print("det(R) =", torch.det(R1).item())             # should be +1 ± 1e-3
+print("Rᵀ·R  ≈ I ?", torch.allclose(R1.T @ R1, torch.eye(3, device=R1.device), atol=1e-4))
+print("t  ≈ origin->world ?", t1)
+
+origin_world = (torch.zeros(1,3, device=R1.device) @ R1.T) + t1
+print(origin_world, "<- should equal t1")
+
+print("camera coords (first 5):\n", pred1["means"].view(-1,3)[:5])
 lift_in_place(pred1, R1, t1)
+print("world coords (first 5):\n", pred1["means"].view(-1,3)[:5])
+
 lift_in_place(pred2, R1, t1)   # still expressed in cam-1 frame
 
 # ── write outputs ─────────────────────────────────────────────────────────

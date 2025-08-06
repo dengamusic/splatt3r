@@ -151,6 +151,8 @@ def tensor_to_png(t: torch.Tensor) -> np.ndarray:
     return t.permute(1, 2, 0).detach().cpu().numpy()                # H,W,3
 
 
+
+
 def load_poses(path, expected):
     arr = np.loadtxt(path).reshape(-1, 4, 4)
     assert arr.shape[0] == expected, f"Expected {expected} poses, got {arr.shape[0]}"
@@ -176,7 +178,7 @@ def main():
     )
     ap.add_argument("--images", nargs="+", required=True)
     ap.add_argument("--npz", required=True)
-    ap.add_argument("--posesaftericp", required=True)
+    ap.add_argument("--poses", required=True)
     ap.add_argument("--W", type=int, required=True)
     ap.add_argument("--H", type=int, required=True)
     ap.add_argument("--fx", type=float, required=True)
@@ -226,7 +228,8 @@ def main():
         print(f"{i}: {Path(p).name}")
 
     num_views = len(imgs)
-    poses_c2w = load_poses(args.posesaftericp, num_views)
+
+    poses_c2w   = load_poses(args.poses, num_views)
 
     intrinsics = make_intrinsics(
         args.fx,

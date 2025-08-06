@@ -202,7 +202,7 @@ def main():
     ap.add_argument("npzs", nargs="+", help="Input NPZ globs, e.g. outputs/pair_*/gaussians.npz")
     ap.add_argument("--out", required=True, help="Output merged .npz path")
     ap.add_argument("--ply", help="Optional PLY export path")
-    ap.add_argument("--radius", type=float, default=0.02, help="Deduplication radius in world units (default 2 cm)")
+    ap.add_argument("--radius", type=float, default=0.003, help="Deduplication radius in world units (default 2 cm)")
     args = ap.parse_args()
 
     files = sorted(sum([glob.glob(p) for p in args.npzs], []))

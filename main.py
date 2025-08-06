@@ -7,8 +7,13 @@ import lightning as L
 import lpips
 import omegaconf
 import torch
-import wandb
+os.environ["WANDB_DISABLED"] = "true"
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
+try:
+    import wandb  # noqa
+except Exception:
+    wandb = None
 # Add MAST3R and PixelSplat to the sys.path to prevent issues during importing
 sys.path.append('src/pixelsplat_src')
 sys.path.append('src/mast3r_src')

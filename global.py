@@ -159,7 +159,8 @@ def run_pair(i, j):
 
 
 pairs = list(itertools.combinations(range(len(args.images)), 2))
-#pairs += [(j, i) for i, j in pairs]
+pairs += [(j, i) for i, j in pairs]
+
 v1, v2, p1, p2 = [], [], [], []
 clouds_pairwise = []
 for (i, j) in pairs:
@@ -239,11 +240,11 @@ for c_idx, (view_id, pred_full) in enumerate(clouds_pairwise):
     Mv = c2w_by_view[view_id]
     R, t = Mv[:3, :3], Mv[:3, 3]
     cl["means"] = (cl["means"] @ R.to(dev).T) + t.to(dev)
-#    out_npz = os.path.join(args.outdir, f"cloud_pair_{c_idx:02d}_view{view_id}.npz")
+    out_npz = os.path.join(args.outdir, f"cloud_pair_{c_idx:02d}_view{view_id}.npz")
  #   np.savez_compressed(out_npz, **{k: v.cpu().numpy() for k, v in cl.items()})
- #   if args.save_ply:
-  #      save_as_ply(cl, out_global_cloud.replace(".npz", ".ply"))
-   # print(f"saved {out_npz} ({cl['means'].shape[0]} pts)")
+    if args.save_ply:
+        save_as_ply(cl, out_npz.replace(".npz", ".ply"))
+    print(f"saved {out_npz} ({cl['means'].shape[0]} pts)")
     clouds.append(cl)
     cloud_views.append(view_id)
 merged_global = {}
@@ -297,7 +298,7 @@ merged = {k: [base[k]] for k in base.keys()}
 
 for c_idx in range(len(clouds)):
     view_id = cloud_views[c_idx]
-    if view_id == REF_VIEW:
+    if view_id == 0:
         continue
     cl = clouds[c_idx]
     s_full = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(cl["means"].cpu().numpy()))

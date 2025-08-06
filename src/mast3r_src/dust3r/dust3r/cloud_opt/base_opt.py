@@ -322,20 +322,20 @@ class BasePCOptimizer (nn.Module):
         viz.show(**kw)
         return viz
 
-
-def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6):
+def global_alignment_loop(net, log_path=None, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6):
     params = [p for p in net.parameters() if p.requires_grad]
     if not params:
         return net
 
     verbose = net.verbose
     if verbose:
-        print('Global alignement - optimizing for:')
+        print('Global alignment - optimizing for:')
         print([name for name, value in net.named_parameters() if value.requires_grad])
 
     lr_base = lr
     optimizer = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.9))
 
+    losses = []
     loss = float('inf')
     if verbose:
         with tqdm.tqdm(total=niter) as bar:
@@ -343,9 +343,20 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
                 loss, lr = global_alignment_iter(net, bar.n, niter, lr_base, lr_min, optimizer, schedule)
                 bar.set_postfix_str(f'{lr=:g} loss={loss:g}')
                 bar.update()
+                losses.append(loss)
     else:
         for n in range(niter):
             loss, _ = global_alignment_iter(net, n, niter, lr_base, lr_min, optimizer, schedule)
+            losses.append(loss)
+
+    # Optional: save loss curve to file
+    try:
+        with open(log_path, "w") as f:
+            for i, l in enumerate(losses):
+                f.write(f"{i+1} {l:.6f}\n")
+    except Exception as e:
+        print(f"Warning: failed to write loss log: {e}")
+
     return loss
 
 

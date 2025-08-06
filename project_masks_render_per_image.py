@@ -9,6 +9,8 @@ import torch.nn as nn
 from plyfile import PlyData, PlyElement
 import torch.nn.functional as F
 import csv
+
+import itertools
 from collections import defaultdict
 # package‑qualified imports from your repo
 from splatt3r.utils.geometry import build_covariance, normalize_intrinsics
@@ -71,6 +73,86 @@ class DecoderSplattingCUDA(torch.nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+def iou_sets(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    u = len(a | b)
+    if u == 0:
+        return 0.0
+    return len(a & b) / float(u)
+
+class _DSU:
+    def __init__(self, n: int):
+        self.p = list(range(n))
+        self.r = [0] * n
+    def find(self, x: int) -> int:
+        if self.p[x] != x:
+            self.p[x] = self.find(self.p[x])
+        return self.p[x]
+    def union(self, a: int, b: int) -> bool:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        if self.r[ra] < self.r[rb]:
+            ra, rb = rb, ra
+        self.p[rb] = ra
+        if self.r[ra] == self.r[rb]:
+            self.r[ra] += 1
+        return True
+
+def paint_dc_for_local(pt, local_ids: torch.Tensor, colors: torch.Tensor):
+    """
+    In-place: zero higher-order SH and set DC to `colors` for the selected local ids.
+    pt["sh"]: [1, G, 3*d]
+    local_ids: [K] (indices into the subset order)
+    colors: [K, 3] in [0,1]
+    """
+    sh = pt["sh"]
+    assert sh.dim() == 3 and sh.shape[0] == 1, "expected sh shape [1, G, 3*d]"
+    B, G, D = sh.shape
+    d = D // 3
+    # zero HO and set DC per channel
+    sh[:, local_ids, :] = 0
+    sh[:, local_ids, 0]       = colors[:, 0]  # R DC
+    sh[:, local_ids, d + 0]   = colors[:, 1]  # G DC
+    sh[:, local_ids, 2 * d + 0] = colors[:, 2]  # B DC
+    return pt
+
+def save_subset_as_ply_with_sh_override(full_cloud, idx: torch.Tensor, sh_override: torch.Tensor, path: Path):
+    """
+    Same as save_as_ply but takes the SH from `sh_override` (shape [1, G, 3*d]),
+    and extracts DCs from [0, d, 2d] to write f_dc_0..2.
+    """
+    means = full_cloud["means"][idx].detach().cpu().numpy()
+    rot   = full_cloud["rotations"][idx].detach().cpu().numpy()
+    scale = torch.exp(full_cloud["log_scales"][idx]).detach().cpu().numpy()
+    opa   = torch.sigmoid(full_cloud["logit_opacities"][idx]).detach().cpu().numpy()
+
+    _, G, D = sh_override.shape
+    d = D // 3
+    sh_dc = torch.stack([
+        sh_override[0, :, 0],
+        sh_override[0, :, d + 0],
+        sh_override[0, :, 2 * d + 0],
+    ], dim=-1).detach().cpu().numpy()
+
+    zeros = np.zeros_like(means, dtype=np.float32)
+    attrs = np.concatenate([means, zeros, sh_dc, opa, np.log(scale), rot], -1).astype(np.float32)
+
+    names = [
+        "x", "y", "z",
+        "nx", "ny", "nz",
+        "f_dc_0", "f_dc_1", "f_dc_2",
+        "opacity",
+        "scale_0", "scale_1", "scale_2",
+        "rot_0", "rot_1", "rot_2", "rot_3"
+    ]
+    dtype = np.dtype([(n, "f4") for n in names])
+    verts = np.empty(attrs.shape[0], dtype=dtype)
+    verts[:] = list(map(tuple, attrs))
+
+    PlyData([PlyElement.describe(verts, "vertex")], text=False).write(str(path))
+
 def to_png(t: torch.Tensor) -> np.ndarray:
     t = t.detach().clamp(0, 1).mul_(255).to(torch.uint8)
     return t.permute(1, 2, 0).cpu().numpy()
@@ -232,8 +314,13 @@ def main():
     parser.add_argument("root", type=Path, help="Base directory, e.g. data/room0_14_16")
     parser.add_argument("--scale", type=float, default=None,
                         help="Override scale from intrinsics.txt (default: use file value or 1.0)")
-    parser.add_argument("--max_points", type=int, default=None,
+    parser.add_argument("--max_points", type=int, default=700000,
                         help="Cap Gaussians globally (applies to full+mask+composite).")
+    parser.add_argument("--merge_iou_thresh", type=float, default=0.25,
+                        help="Min IoU between gaussian-index sets to connect groups.")
+    parser.add_argument("--merge_clip_thresh", type=float, default=0.30,
+                        help="Min CLIP cosine similarity between masks to connect groups.")
+
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -241,7 +328,7 @@ def main():
     # expected layout
     imgs_dir   = root / "imgs"
     gsam_dir   = root / "gsam_npz"
-    gaussians  = root / "merged_global.npz"
+    gaussians  = root / "merged_icp.npz"
     poses_file = root / "poses_w2c.txt"
     intr_file  = root / "intrinsics.txt"
     out_dir    = root / "vis"
@@ -291,7 +378,7 @@ def main():
     # ---- accumulate across ALL views (moved out of the loop) ----
     view_rows = []
     mask_rows = []
-
+    all_groups = []
     for view_idx, img_path in enumerate(images):
         print(f"[view {view_idx}] {img_path.name}")
 
@@ -358,7 +445,12 @@ def main():
             masks_t = F.interpolate(masks_t[:, None], size=(Hs, Ws), mode="nearest").squeeze(1)
         masks_t = masks_t.bool()
 
-        # gaussians visible in this view (already have valid_idx after subset)
+            # Load per-mask CLIP features from preprocessing
+        clip_feats_np = gsam["clip"]
+        clip_feats_t = torch.from_numpy(clip_feats_np).float()
+        clip_feats_t = torch.nn.functional.normalize(clip_feats_t, dim=1)  # cosine-ready
+    
+    # gaussians visible in this view (already have valid_idx after subset)
         u_valid = u[valid_idx]
         v_valid = v[valid_idx]
 
@@ -372,6 +464,15 @@ def main():
                 continue
             local_map[m_id] = g_idx
             used_indices.append(g_idx)
+            
+                        # Collect a group only if we have a CLIP feature for this mask
+            if clip_feats_t is not None:
+                all_groups.append({
+                    "view_id": int(view_idx),
+                    "mask_id": int(m_id),
+                    "idx_set": set(g_idx.detach().long().tolist()),
+                    "clip": clip_feats_t[m_id].cpu(),  # keep on CPU
+                })
 
             # Per-mask render + metrics
             label_str = str(labels_np[m_id]) if m_id < len(labels_np) else f"mask{m_id}"
@@ -439,8 +540,179 @@ def main():
                 rgb_pred_comp, _ = renderer(batch_comp, pt_comp, (Hs, Ws))
             comp_img = to_png(rgb_pred_comp[0, 0])
             imageio.imwrite(out_dir / f"view{view_idx:03d}_MASKCOMP.png", np.concatenate([gt_img, comp_img], axis=1))
+            
+            if view_idx == 0:
+                pos_in_choose = {int(i.item()): p for p, i in enumerate(choose_global)}
+
+                # First-hit-wins assignment of a color per gaussian
+                # (if a gaussian falls into overlapping masks)
+                mask_colors = assign_mask_colors(M, dev)
+                selected_local = []
+                selected_colors = []
+                taken = torch.zeros(choose_global.numel(), dtype=torch.bool, device=dev)
+
+                for m_id, g_idx in local_map.items():
+                    c = mask_colors[m_id]
+                    for gi in g_idx.tolist():
+                        p = pos_in_choose.get(gi, None)
+                        if p is None or taken[p]:
+                            continue
+                        selected_local.append(p)
+                        selected_colors.append(c)
+                        taken[p] = True
+
+                if len(selected_local):
+                    local_ids = torch.tensor(selected_local, dtype=torch.long, device=dev)
+                    colors_local = torch.stack(selected_colors, dim=0)
+
+                    # Start from the full subset (same cloud used everywhere)
+                    pt_full_color = subset_cloud(full_cloud, choose_global)
+                    # Overwrite SH for only the selected Gaussians
+                    paint_dc_for_local(pt_full_color, local_ids, colors_local)
+
+                    # Render from view0
+                    batch0 = {
+                        "context": [{"camera_pose": poses_w2c[0].unsqueeze(0),
+                                     "camera_intrinsics": intrinsics_batch}],
+                        "target":  [{"camera_pose": poses_w2c[0].unsqueeze(0),
+                                     "camera_intrinsics": intrinsics_batch}],
+                    }
+                    with torch.no_grad():
+                        rgb_pred_total, _ = renderer(batch0, pt_full_color, (Hs, Ws))
+                    total_img = to_png(rgb_pred_total[0, 0])
+                    imageio.imwrite(out_dir / "view000_FULL_MASKCOLOR_TOTAL.png",
+                                    np.concatenate([gt_img, total_img], axis=1))
+
+                    # Optional: write a PLY of the same full subset with recolored DCs
+                    save_subset_as_ply_with_sh_override(
+                        full_cloud, choose_global, pt_full_color["sh"],
+                        out_dir / "full_cloud_colored_by_view0.ply"
+                    )
+
 
         view_rows.append(row_view)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Cross-view merging using IoU + CLIP cosine (precomputed features)
+    # ──────────────────────────────────────────────────────────────────────────
+    if all_groups:
+        n = len(all_groups)
+        sets  = [g["idx_set"] for g in all_groups]
+        views = [g["view_id"] for g in all_groups]
+        feats = torch.stack([g["clip"] for g in all_groups], dim=0)  # [n,D], unit-norm
+
+        dsu = _DSU(n)
+        for i in range(n):
+            Si, fi = sets[i], feats[i]
+            for j in range(i + 1, n):
+                if iou_sets(Si, sets[j]) < args.merge_iou_thresh:
+                    continue
+                sim = float(torch.dot(fi, feats[j]).item())  # cosine (unit-norm)
+                if sim < args.merge_clip_thresh:
+                    continue
+                dsu.union(i, j)
+
+        # Connected components → clusters
+        comp_map = {}
+        for i in range(n):
+            r = dsu.find(i)
+            comp_map.setdefault(r, []).append(i)
+
+        cluster_infos = []
+        gaussian_to_cluster = {}
+        for cid, member_idx in enumerate(comp_map.values()):
+            member_sets  = [sets[k] for k in member_idx]
+            member_feats = feats[member_idx]
+            member_views = [views[k] for k in member_idx]
+
+            # Minimal metrics
+            union_set = set().union(*member_sets)
+            views_count = len(set(member_views))
+            pair_ious, pair_sims = [], []
+            for a, b in itertools.combinations(range(len(member_idx)), 2):
+                pair_ious.append(iou_sets(member_sets[a], member_sets[b]))
+                pair_sims.append(float(torch.dot(member_feats[a], member_feats[b]).item()))
+            iou_mean = float(sum(pair_ious) / len(pair_ious)) if pair_ious else 1.0
+            iou_min  = float(min(pair_ious)) if pair_ious else 1.0
+            clip_mean = float(sum(pair_sims) / len(pair_sims)) if pair_sims else 1.0
+            clip_min  = float(min(pair_sims)) if pair_sims else 1.0
+            score = 0.5 * (iou_mean + clip_mean)
+
+            for gidx in union_set:
+                gaussian_to_cluster[gidx] = cid
+
+            cluster_infos.append({
+                "cluster_id": cid,
+                "n_members": len(member_idx),
+                "views": views_count,
+                "union_size": len(union_set),
+                "iou_mean": round(iou_mean, 6),
+                "iou_min":  round(iou_min, 6),
+                "clip_mean": round(clip_mean, 6),
+                "clip_min":  round(clip_min, 6),
+                "score": round(score, 6),
+            })
+
+        # Save Gaussian → cluster assignments
+        assign = np.full((G,), -1, dtype=np.int32)
+        for gidx, cid in gaussian_to_cluster.items():
+            if 0 <= gidx < G:
+                assign[gidx] = cid
+        np.save(out_dir / "cluster_assignments.npy", assign)
+
+                # ───────────────── Save a PLY: clusters → unique colors ─────────────────
+        # num clusters and a reproducible color palette
+        num_clusters = len(cluster_infos)
+        if num_clusters > 0:
+            cluster_colors = assign_mask_colors(num_clusters, dev)  # [C,3] in [0,1]
+
+            # Build subset to modify (same subset used everywhere in the script)
+            pt_full_color = subset_cloud(full_cloud, choose_global)   # dict with "sh"
+            sh = pt_full_color["sh"]                                  # [1,Gs,3*d]
+            _, Gs, D = sh.shape
+            d = D // 3
+
+            # Map global gaussian index -> local position in choose_global
+            pos_in_choose = {int(i.item()): p for p, i in enumerate(choose_global)}
+
+            # Overwrite DC (and zero higher orders) for gaussians that belong to a cluster
+            # Unclustered gaussians keep their original SH
+            local_ids = []
+            colors    = []
+            for gidx, cid in gaussian_to_cluster.items():
+                p = pos_in_choose.get(int(gidx))
+                if p is None:  # not in the saved subset (e.g., cut by --max_points)
+                    continue
+                local_ids.append(p)
+                colors.append(cluster_colors[int(cid)])
+
+            if local_ids:
+                local_ids = torch.tensor(local_ids, device=dev, dtype=torch.long)
+                colors    = torch.stack(colors, dim=0)  # [K,3]
+
+                # zero higher-order SH for colored gaussians, then set DC per channel
+                sh[:, local_ids, :] = 0
+                sh[:, local_ids, 0]       = colors[:, 0]  # R
+                sh[:, local_ids, d + 0]   = colors[:, 1]  # G
+                sh[:, local_ids, 2 * d + 0] = colors[:, 2]  # B
+
+            # Write PLY
+            ply_path = out_dir / "full_cloud_clusters_colored.ply"
+            save_subset_as_ply_with_sh_override(full_cloud, choose_global, sh, ply_path)
+            print("wrote", ply_path)
+
+        # Save a compact CSV summary
+        if cluster_infos:
+            merge_csv = out_dir / "merged_groups.csv"
+            with open(merge_csv, "w", newline="") as f:
+                cols = ["cluster_id","n_members","views","union_size",
+                        "iou_mean","iou_min","clip_mean","clip_min","score"]
+                w = csv.DictWriter(f, fieldnames=cols)
+                w.writeheader()
+                for row in cluster_infos:
+                    w.writerow(row)
+            print("wrote", merge_csv)
+
 
     # ---- WRITE CSVs (now contain all views) ----
     view_csv = out_dir / "view_metrics.csv"

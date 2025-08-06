@@ -2,52 +2,70 @@ import torch
 from einops import rearrange, repeat
 
 from .cuda_splatting import render_cuda
-from utils.geometry import normalize_intrinsics
+from splatt3r.utils.geometry import normalize_intrinsics
 
 
 class DecoderSplattingCUDA(torch.nn.Module):
+    """Differentiable renderer for 3‑D Gaussian splats (CUDA backend).
 
-    def __init__(self, background_color):
+    Shapes
+    ------
+    Context & target in ``batch``
+      camera_pose        : [b,4,4]  (c2w)
+      camera_intrinsics  : [b,4,4]
+
+    ``pred`` dictionary
+      means              : [b,n,3]
+      covariances        : [b,n,3,3]
+      sh                 : [b,n,C] (spherical‑harmonics coefficients)
+      opacities          : [b,n]
+
+    Returns
+    -------
+      color : [b,v,3,H,W]  RGB for each target view
+    """
+
+    def __init__(self, background_color=(0.0, 0.0, 0.0)):
         super().__init__()
         self.register_buffer(
             "background_color",
             torch.tensor(background_color, dtype=torch.float32),
             persistent=False,
         )
-    
-    def forward(self, batch, pred1, pred2, image_shape):
 
-        base_pose = batch['context'][0]['camera_pose'] # [b, 4, 4]
-        inv_base_pose = torch.inverse(base_pose)
+    def forward(self, batch, pred, image_shape):
+        base_c2w = batch["context"][0]["camera_pose"]            # [b,4,4]
+        inv_base = torch.inverse(base_c2w)                         # [b,4,4]
 
-        extrinsics = torch.stack([target_view['camera_pose'] for target_view in batch['target']], dim=1)
-        intrinsics = torch.stack([target_view['camera_intrinsics'] for target_view in batch['target']], dim=1)
-        intrinsics = normalize_intrinsics(intrinsics, image_shape)[..., :3, :3]
+        # Stack target extrinsics & intrinsics along view dim v
+        extrinsics = torch.stack(
+            [t["camera_pose"] for t in batch["target"]], dim=1
+        )  # [b,v,4,4]
+        intrinsics = torch.stack(
+            [t["camera_intrinsics"] for t in batch["target"]], dim=1
+        )  # [b,v,4,4]
 
-        # Rotate the ground truth extrinsics into the coordinate system used by MAST3R
-        # --i.e. in the coordinate system of the first context view, normalized by the scene scale
-        extrinsics = inv_base_pose[:, None, :, :] @ extrinsics
+        intrinsics = normalize_intrinsics(intrinsics, image_shape)[..., :3, :3]  # [b,v,3,3]
+        extrinsics = inv_base[:, None] @ extrinsics                                # world→cam_rel
 
-        means = torch.stack([pred1["means"], pred2["means_in_other_view"]], dim=1)
-        covariances = torch.stack([pred1["covariances"], pred2["covariances"]], dim=1)
-        harmonics = torch.stack([pred1["sh"], pred2["sh"]], dim=1)
-        opacities = torch.stack([pred1["opacities"], pred2["opacities"]], dim=1)
-
-        b, v, _, _ = extrinsics.shape
-        near = torch.full((b, v), 0.1, device=means.device)
-        far = torch.full((b, v), 1000.0, device=means.device)
+        # Expand point cloud along v (so we can flatten to (b*v))
+        b, v = extrinsics.shape[:2]
+        means = rearrange(pred["means"], "b n d -> b 1 n d").expand(-1, v, -1, -1)
+        covs = rearrange(pred["covariances"], "b n i j -> b 1 n i j").expand(-1, v, -1, -1, -1)
+        sh = rearrange(pred["sh"], "b n c -> b 1 n c").expand(-1, v, -1, -1)
+        opac = rearrange(pred["opacities"], "b n -> b 1 n").expand(-1, v, -1)
 
         color = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),
             rearrange(intrinsics, "b v i j -> (b v) i j"),
-            rearrange(near, "b v -> (b v)"),
-            rearrange(far, "b v -> (b v)"),
+            torch.full((b * v,), 0.1, device=extrinsics.device),
+            torch.full((b * v,), 1000.0, device=extrinsics.device),
             image_shape,
             repeat(self.background_color, "c -> (b v) c", b=b, v=v),
-            repeat(rearrange(means, "b v h w xyz -> b (v h w) xyz"), "b g xyz -> (b v) g xyz", v=v),
-            repeat(rearrange(covariances, "b v h w i j -> b (v h w) i j"), "b g i j -> (b v) g i j", v=v),
-            repeat(rearrange(harmonics, "b v h w c d_sh -> b (v h w) c d_sh"), "b g c d_sh -> (b v) g c d_sh", v=v),
-            repeat(rearrange(opacities, "b v h w 1 -> b (v h w)"), "b g -> (b v) g", v=v),
+            rearrange(means, "b v n d    -> (b v) n d"),
+            rearrange(covs, "b v n i j -> (b v) n i j"),
+            rearrange(sh, "b v n c     -> (b v) n c 1"),
+            rearrange(opac, "b v n      -> (b v) n"),
         )
-        color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
-        return color, None
+
+        return rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v), None
