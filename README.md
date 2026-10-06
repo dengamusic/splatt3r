@@ -1,5 +1,15 @@
 # Extending Splatt3R: Multi-View Semantic Gaussian Splatting - Pipeline Usage
 
+**Nanxing Deng, Junzhe Gou, Fatih Mustafa Tuğlu**
+
+## Poster
+
+[![Extending Splatt3R: Multi-View Semantic Gaussian Splatting poster](assets/poster.png)](assets/poster.pdf)
+
+Click the image to open the full-resolution [PDF poster](assets/poster.pdf).
+
+---
+
 This project provides a one-command Bash pipeline **and** per-script entry points.
 
 ## Called Scripts (in order)
